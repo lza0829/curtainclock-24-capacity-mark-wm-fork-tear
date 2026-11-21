@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from app.db import connect, transaction
+from app.services import capacity_panel
 from app.services.ready import assess_admission, readiness
 
 router = APIRouter(tags=["windows"])
@@ -31,6 +32,9 @@ def _window_payload(conn, row) -> dict:
 
 @router.get("/windows")
 def list_windows():
+    # 读前对账：live 批窗的钉扎旗必须能由其 open 租约重放，无租约不得带旗。
+    with transaction() as conn:
+        capacity_panel.reconcile_capacity(conn)
     conn = connect()
     try:
         rows = conn.execute(

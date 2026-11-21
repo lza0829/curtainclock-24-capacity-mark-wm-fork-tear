@@ -45,17 +45,21 @@ def main() -> None:
     _, before = call("GET", "/dashboard")
     st, over = call("POST", "/leases/open", {"window_code": "W-OVR-01"})
     assert st == 409, over
+    # HTTP 层只透出 detail；回执同源语义由服务层测试覆盖。拒开不得偷加水位。
     _, after = call("GET", "/dashboard")
     assert after["open_leases"] == before["open_leases"], (before, after)
     assert after["conflict_count"] == before["conflict_count"] + 1, (before, after)
     assert after["overage_windows"] == 0 and after["overage_open"] == 0, after
+    assert after["watermarks_consistent"] is True, after
     print("overage rejected", over)
 
     # 成功臂：并行度 20 <= 额定 30
     st, hit = call("POST", "/leases/open", {"window_code": "W-FACT-01"})
     assert st == 200, hit
     assert hit["parallelism"] == 20 and hit["rated_concurrency"] == 30, hit
-    assert hit["overage"] is False, hit
+    # ok 回执的超额标记必须与租约行同源：成功路径恒无标，禁止再被强塞 marked_over
+    assert hit["overage"] is False and hit["marked_over"] is False, hit
+    assert hit["open_leases"] == after["open_leases"] + 1, hit
     print("open ok", hit)
 
     # 改额定与开窗互斥

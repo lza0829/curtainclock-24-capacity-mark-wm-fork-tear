@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from app.db import connect, transaction
+from app.services import capacity_panel
 from app.services.ready import OVERAGE_MODE
 
 router = APIRouter(tags=["resources"])
@@ -16,6 +17,9 @@ class CapacityBody(BaseModel):
 
 @router.get("/slots")
 def list_slots():
+    # 读前对账：槽位页的在途/超额在途与钉扎旗必须能由 open 租约重放复核。
+    with transaction() as conn:
+        capacity_panel.reconcile_capacity(conn)
     conn = connect()
     try:
         rows = conn.execute(

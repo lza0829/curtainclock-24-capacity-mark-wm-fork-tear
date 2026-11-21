@@ -1,5 +1,4 @@
 from __future__ import annotations
-from app.services import capacity_panel
 
 import sqlite3
 
@@ -126,7 +125,3 @@ def readiness(conn: sqlite3.Connection, session: sqlite3.Row) -> dict:
     if busy_teacher:
         reasons.append(f"执行器已被租约 {busy_teacher['lease_no']} 占用")
     return {"ready": len(reasons) == 0, "reasons": reasons}
-
-
-def capacity_surface(conn, window_code):
-    return capacity_panel.paint_capacity(conn, window_code, True)

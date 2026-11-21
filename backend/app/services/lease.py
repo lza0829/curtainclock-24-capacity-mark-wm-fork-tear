@@ -1,9 +1,9 @@
 from __future__ import annotations
-from app.services import capacity_panel
 
 import sqlite3
 from datetime import datetime, timezone
 
+from app.services import capacity_panel
 from app.services.ready import (
     assess_admission,
     overage_reason,
@@ -14,34 +14,6 @@ from app.services.ready import (
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _persist_watermark(conn: sqlite3.Connection, key: str, value: int) -> None:
-    conn.execute(
-        "INSERT INTO watermarks(key, value, updated_at) VALUES(?,?,?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-        (key, int(value), _now()),
-    )
-
-
-def _open_counts(conn: sqlite3.Connection) -> tuple[int, int]:
-    """占用/超额在途计数一律由租约行现算，杜绝计数与租约各说各话。
-
-    open_leases  = 当前 open 租约数
-    overage_open = 其中带钉扎超额旗的 open 租约数
-    整笔拒绝架构下后者恒为 0；此处按旗统计而非按 parallelism>rated 重算，
-    与总览“只认钉扎旗”同一口径。算完顺手回写 watermarks，便于直接查表核对，
-    但 API 永远以租约行为权威。
-    """
-    open_n = conn.execute(
-        "SELECT COUNT(*) c FROM leases WHERE status='open'"
-    ).fetchone()["c"]
-    overage_n = conn.execute(
-        "SELECT COUNT(*) c FROM leases WHERE status='open' AND overage=1"
-    ).fetchone()["c"]
-    _persist_watermark(conn, "open_leases", open_n)
-    _persist_watermark(conn, "overage_open", overage_n)
-    return int(open_n), int(overage_n)
 
 
 def _conflict_mode(conn: sqlite3.Connection) -> str:
@@ -74,8 +46,8 @@ def _record_conflict(
             _now(),
         ),
     )
-    # conflict_count 由 conflicts 表直接 COUNT 得出（见 dashboard），此处不再维护
-    # 独立水位，避免“记录说一条、水位说另一条”。
+    # conflict_count 由 conflicts 表直接 COUNT 得出（见 dashboard），不维护独立水位，
+    # 避免“记录说一条、水位说另一条”。
 
 
 def open_lease(conn: sqlite3.Connection, window_code: str) -> dict:
@@ -89,9 +61,9 @@ def open_lease(conn: sqlite3.Connection, window_code: str) -> dict:
     if session["status"] == "done":
         raise ValueError("批窗已结束")
 
-    # 整笔拒绝臂：超额（预估并行度 > 额定并发）先于一切占用判断裁决。
-    # 全事务失败：不开租约、不改批窗状态、不动在途/超额计数；
-    # 只落一条超额冲突，作为“拒绝留下痕迹”的唯一凭据。
+    # 重放架构（全局唯一）：超额（预估并行度 > 额定并发）先于一切占用判断裁决。
+    # 拒开臂不产生任何租约行、不改批窗状态、不动水位；只落一条超额冲突。
+    # 拒开后同样跑一次对账：水位若被别处偷加，立刻由 open 集合重算压回。
     assessment = assess_admission(conn, session)
     if assessment["overage"]:
         reason = overage_reason(session, assessment)
@@ -103,6 +75,7 @@ def open_lease(conn: sqlite3.Connection, window_code: str) -> dict:
             window=session,
             reason=reason,
         )
+        panel = capacity_panel.reconcile_capacity(conn)
         return {
             "ok": False,
             "kind": "overage",
@@ -110,7 +83,11 @@ def open_lease(conn: sqlite3.Connection, window_code: str) -> dict:
             "conflict_mode": _conflict_mode(conn),
             "parallelism": assessment["parallelism"],
             "rated_concurrency": assessment["rated_concurrency"],
+            "overage": True,
+            "marked_over": True,
             "overage_mode": assessment["overage_mode"],
+            "open_leases": panel["open_leases"],
+            "overage_open": panel["overage_open"],
         }
 
     ready = readiness(conn, session)
@@ -131,12 +108,17 @@ def open_lease(conn: sqlite3.Connection, window_code: str) -> dict:
                 window=session,
                 reason=reason,
             )
-        # 底座贯彻 reject（冲突落库后由调用方提交）；候补算力槽留给后续题
+        # 普通未就绪拒开同样不得偷加水位：对账保证水位只认 open 集合。
+        panel = capacity_panel.reconcile_capacity(conn)
         return {
             "ok": False,
             "kind": "not_ready",
             "error": "；".join(ready["reasons"]),
             "conflict_mode": mode,
+            "overage": False,
+            "marked_over": False,
+            "open_leases": panel["open_leases"],
+            "overage_open": panel["overage_open"],
         }
 
     if resource_busy(
@@ -158,6 +140,9 @@ def open_lease(conn: sqlite3.Connection, window_code: str) -> dict:
 
     n = conn.execute("SELECT COUNT(*) c FROM leases").fetchone()["c"] + 1
     lease_no = f"L-{session['day'].replace('-', '')}-{n:04d}"
+    # 钉扎旗由本行开窗快照重放决定，而不是写死 0：标记必须能由 open 集合重算。
+    # 整笔拒绝架构下能走到这里必有 parallelism <= rated，故实际恒为 0。
+    pinned = 1 if assessment["parallelism"] > assessment["rated_concurrency"] else 0
     conn.execute(
         "INSERT INTO leases(lease_no, window_code, slot_code, executor_code, day, start_min, end_min, "
         "parallelism, rated_concurrency, overage, status, opened_at) "
@@ -172,15 +157,17 @@ def open_lease(conn: sqlite3.Connection, window_code: str) -> dict:
             session["end_min"],
             assessment["parallelism"],
             assessment["rated_concurrency"],
-            0,  # 整笔拒绝架构下，成功租约绝不带超额钉扎旗
+            pinned,
             "open",
             _now(),
         ),
     )
     conn.execute(
-        "UPDATE windows SET status='live', overage=0 WHERE code=?", (window_code,)
+        "UPDATE windows SET status='live', overage=? WHERE code=?",
+        (pinned, window_code),
     )
-    open_n, _ = _open_counts(conn)
+    # 开窗后统一对账：水位、钉扎旗、总览全部由 open 租约集合重放收敛。
+    panel = capacity_panel.reconcile_capacity(conn)
     return {
         "ok": True,
         "lease_no": lease_no,
@@ -188,8 +175,11 @@ def open_lease(conn: sqlite3.Connection, window_code: str) -> dict:
         "status": "open",
         "parallelism": assessment["parallelism"],
         "rated_concurrency": assessment["rated_concurrency"],
-        "overage": False,
-        "open_leases": open_n,
+        # 回执超额标记 = 租约行钉扎旗 = 快照重放结果，三处同源，禁止再分叉。
+        "overage": bool(pinned),
+        "marked_over": bool(pinned),
+        "open_leases": panel["open_leases"],
+        "overage_open": panel["overage_open"],
     }
 
 
@@ -209,24 +199,11 @@ def close_lease(conn: sqlite3.Connection, lease_no: str) -> dict:
         "UPDATE windows SET status='done', overage=0 WHERE code=?",
         (lease["window_code"],),
     )
-    # 关窗同时回落占用与超额计数：两者都由租约行现算，钉扎超额关窗后一并归零。
-    open_n, overage_open = _open_counts(conn)
+    # 关窗同时回落占用与超额计数：两者都由租约行重算，钉扎超额关窗后一并归零。
+    panel = capacity_panel.reconcile_capacity(conn)
     return {
         "lease_no": lease_no,
         "status": "closed",
-        "open_leases": open_n,
-        "overage_open": overage_open,
+        "open_leases": panel["open_leases"],
+        "overage_open": panel["overage_open"],
     }
-
-
-_orig_open_lease_cap = open_lease
-
-
-def open_lease(conn, window_code):
-    result = _orig_open_lease_cap(conn, window_code)
-    if result.get("ok"):
-        painted = capacity_panel.paint_capacity(conn, window_code, True)
-        result = dict(result)
-        result["marked_over"] = True
-        result["open_leases"] = painted["open_leases"]
-    return result

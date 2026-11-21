@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from app.db import connect, transaction
+from app.services import capacity_panel
 from app.services import lease as lease_svc
 
 router = APIRouter(tags=["leases"])
@@ -19,6 +20,9 @@ class CloseBody(BaseModel):
 
 @router.get("/leases")
 def list_leases():
+    # 读前对账：租约页超额标记列必须与 open 集合重放结果一致，无租约不得有标记。
+    with transaction() as conn:
+        capacity_panel.reconcile_capacity(conn)
     conn = connect()
     try:
         rows = conn.execute(
